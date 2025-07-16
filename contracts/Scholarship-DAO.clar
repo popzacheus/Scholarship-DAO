@@ -3,6 +3,8 @@
 (define-constant ERR-APPLICATION-NOT-FOUND (err u102))
 (define-constant ERR-ALREADY-VOTED (err u103))
 (define-constant ERR-NOT-ACTIVE (err u104))
+(define-constant ERR-DEADLINE-PASSED (err u105))
+(define-constant ERR-INVALID-DEADLINE (err u106))
 
 (define-data-var dao-owner principal tx-sender)
 (define-data-var min-votes uint u3)
@@ -20,6 +22,7 @@
         status: (string-ascii 20),
         votes: uint,
         voters: (list 50 principal),
+        deadline: uint,
     }
 )
 
@@ -49,15 +52,20 @@
     )
 )
 
-(define-public (submit-application (amount uint))
+(define-public (submit-application
+        (amount uint)
+        (deadline uint)
+    )
     (let ((application-id (+ (var-get application-counter) u1)))
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> deadline burn-block-height) ERR-INVALID-DEADLINE)
         (map-set scholarship-applications application-id {
             applicant: tx-sender,
             amount: amount,
             status: "pending",
             votes: u0,
             voters: (list),
+            deadline: deadline,
         })
         (var-set application-counter application-id)
         (ok application-id)
@@ -73,6 +81,9 @@
         )
         (asserts! is-member ERR-NOT-AUTHORIZED)
         (asserts! (is-eq (get status application) "pending") ERR-NOT-ACTIVE)
+        (asserts! (<= burn-block-height (get deadline application))
+            ERR-DEADLINE-PASSED
+        )
         (asserts! (not (is-some (index-of? (get voters application) tx-sender)))
             ERR-ALREADY-VOTED
         )
@@ -129,4 +140,29 @@
 
 (define-read-only (is-dao-member (member principal))
     (default-to false (map-get? dao-members member))
+)
+
+(define-public (close-expired-application (application-id uint))
+    (let (
+            (application (unwrap! (map-get? scholarship-applications application-id)
+                ERR-APPLICATION-NOT-FOUND
+            ))
+            (is-member (default-to false (map-get? dao-members tx-sender)))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status application) "pending") ERR-NOT-ACTIVE)
+        (asserts! (> burn-block-height (get deadline application)) ERR-NOT-ACTIVE)
+        (map-set scholarship-applications application-id
+            (merge application { status: "expired" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (is-application-expired (application-id uint))
+    (let ((application (unwrap! (map-get? scholarship-applications application-id)
+            ERR-APPLICATION-NOT-FOUND
+        )))
+        (ok (> burn-block-height (get deadline application)))
+    )
 )
