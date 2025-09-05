@@ -8,6 +8,7 @@
 (define-constant ERR-MILESTONE-NOT-FOUND (err u107))
 (define-constant ERR-MILESTONE-COMPLETED (err u108))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u109))
+(define-constant ERR-INVALID-REPUTATION-SCORE (err u110))
 
 (define-data-var dao-owner principal tx-sender)
 (define-data-var min-votes uint u3)
@@ -40,6 +41,16 @@
         completed: bool,
         completion-votes: uint,
         completion-voters: (list 50 principal),
+    }
+)
+
+(define-map applicant-reputation
+    principal
+    {
+        score: uint,
+        completed-milestones: uint,
+        total-milestones: uint,
+        last-updated: uint,
     }
 )
 
@@ -209,6 +220,8 @@
             completion-voters: (list),
         })
         (var-set milestone-counter milestone-id)
+        (unwrap-panic (initialize-applicant-reputation (get applicant application)))
+        (unwrap-panic (update-milestone-count (get applicant application) u1))
         (ok milestone-id)
     )
 )
@@ -259,6 +272,7 @@
                             (get amount milestone)
                         ) }
                         ))
+                    (unwrap-panic (update-reputation-on-completion (get applicant application)))
                     (ok true)
                 )
                 (err ERR-INSUFFICIENT-FUNDS)
@@ -280,6 +294,86 @@
             total-amount: (get amount application),
             total-disbursed: (get total-disbursed application),
             remaining: (- (get amount application) (get total-disbursed application)),
+        })
+    )
+)
+
+(define-private (initialize-applicant-reputation (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok true)
+        (begin
+            (map-set applicant-reputation applicant {
+                score: u100,
+                completed-milestones: u0,
+                total-milestones: u0,
+                last-updated: burn-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-milestone-count
+        (applicant principal)
+        (count uint)
+    )
+    (let ((reputation (unwrap-panic (map-get? applicant-reputation applicant))))
+        (map-set applicant-reputation applicant
+            (merge reputation {
+                total-milestones: (+ (get total-milestones reputation) count),
+                last-updated: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-reputation-on-completion (applicant principal))
+    (let ((reputation (unwrap-panic (map-get? applicant-reputation applicant))))
+        (let (
+                (completed-count (+ (get completed-milestones reputation) u1))
+                (total-count (get total-milestones reputation))
+                (completion-rate (if (> total-count u0)
+                    (/ (* completed-count u100) total-count)
+                    u100
+                ))
+            )
+            (map-set applicant-reputation applicant
+                (merge reputation {
+                    score: completion-rate,
+                    completed-milestones: completed-count,
+                    last-updated: burn-block-height,
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-applicant-reputation (applicant principal))
+    (map-get? applicant-reputation applicant)
+)
+
+(define-read-only (get-reputation-score (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok (get score reputation))
+        (ok u0)
+    )
+)
+
+(define-read-only (get-applicant-stats (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok {
+            completion-rate: (get score reputation),
+            completed-milestones: (get completed-milestones reputation),
+            total-milestones: (get total-milestones reputation),
+            last-activity: (get last-updated reputation),
+        })
+        (ok {
+            completion-rate: u0,
+            completed-milestones: u0,
+            total-milestones: u0,
+            last-activity: u0,
         })
     )
 )
