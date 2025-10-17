@@ -9,6 +9,9 @@
 (define-constant ERR-MILESTONE-COMPLETED (err u108))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u109))
 (define-constant ERR-INVALID-REPUTATION-SCORE (err u110))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u111))
+(define-constant ERR-DELEGATE-NOT-MEMBER (err u112))
+(define-constant ERR-DELEGATION-LOOP (err u113))
 
 (define-data-var dao-owner principal tx-sender)
 (define-data-var min-votes uint u3)
@@ -51,6 +54,14 @@
         completed-milestones: uint,
         total-milestones: uint,
         last-updated: uint,
+    }
+)
+
+(define-map vote-delegations
+    principal
+    {
+        delegate: (optional principal),
+        delegated-at: uint,
     }
 )
 
@@ -106,20 +117,24 @@
             (application (unwrap! (map-get? scholarship-applications application-id)
                 ERR-APPLICATION-NOT-FOUND
             ))
-            (is-member (default-to false (map-get? dao-members tx-sender)))
+            (effective-voter (resolve-voter tx-sender))
+            (is-member (default-to false (map-get? dao-members effective-voter)))
         )
         (asserts! is-member ERR-NOT-AUTHORIZED)
         (asserts! (is-eq (get status application) "pending") ERR-NOT-ACTIVE)
         (asserts! (<= burn-block-height (get deadline application))
             ERR-DEADLINE-PASSED
         )
-        (asserts! (not (is-some (index-of? (get voters application) tx-sender)))
+        (asserts!
+            (not (is-some (index-of? (get voters application) effective-voter)))
             ERR-ALREADY-VOTED
         )
         (map-set scholarship-applications application-id
             (merge application {
                 votes: (+ (get votes application) u1),
-                voters: (unwrap-panic (as-max-len? (append (get voters application) tx-sender) u50)),
+                voters: (unwrap-panic (as-max-len? (append (get voters application) effective-voter)
+                    u50
+                )),
             })
         )
         (unwrap! (process-application application-id) (err u500))
@@ -231,18 +246,20 @@
             (milestone (unwrap! (map-get? scholarship-milestones milestone-id)
                 ERR-MILESTONE-NOT-FOUND
             ))
-            (is-member (default-to false (map-get? dao-members tx-sender)))
+            (effective-voter (resolve-voter tx-sender))
+            (is-member (default-to false (map-get? dao-members effective-voter)))
         )
         (asserts! is-member ERR-NOT-AUTHORIZED)
         (asserts! (not (get completed milestone)) ERR-MILESTONE-COMPLETED)
         (asserts!
-            (not (is-some (index-of? (get completion-voters milestone) tx-sender)))
+            (not (is-some (index-of? (get completion-voters milestone) effective-voter)))
             ERR-ALREADY-VOTED
         )
         (map-set scholarship-milestones milestone-id
             (merge milestone {
                 completion-votes: (+ (get completion-votes milestone) u1),
-                completion-voters: (unwrap-panic (as-max-len? (append (get completion-voters milestone) tx-sender)
+                completion-voters: (unwrap-panic (as-max-len?
+                    (append (get completion-voters milestone) effective-voter)
                     u50
                 )),
             })
@@ -376,4 +393,60 @@
             last-activity: u0,
         })
     )
+)
+
+(define-public (delegate-vote (delegate principal))
+    (let (
+            (is-member (default-to false (map-get? dao-members tx-sender)))
+            (delegate-is-member (default-to false (map-get? dao-members delegate)))
+            (delegate-delegation (map-get? vote-delegations delegate))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (asserts! delegate-is-member ERR-DELEGATE-NOT-MEMBER)
+        (match delegate-delegation
+            del-record (match (get delegate del-record)
+                next-delegate (asserts! (not (is-eq next-delegate tx-sender))
+                    ERR-DELEGATION-LOOP
+                )
+                true
+            )
+            true
+        )
+        (map-set vote-delegations tx-sender {
+            delegate: (some delegate),
+            delegated-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let ((is-member (default-to false (map-get? dao-members tx-sender))))
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (map-set vote-delegations tx-sender {
+            delegate: none,
+            delegated-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-private (resolve-voter (voter principal))
+    (match (map-get? vote-delegations voter)
+        delegation-record (match (get delegate delegation-record)
+            delegate-principal
+            delegate-principal
+            voter
+        )
+        voter
+    )
+)
+
+(define-read-only (get-delegation (member principal))
+    (map-get? vote-delegations member)
+)
+
+(define-read-only (get-effective-voter (member principal))
+    (ok (resolve-voter member))
 )
