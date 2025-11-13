@@ -1,0 +1,452 @@
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-INVALID-AMOUNT (err u101))
+(define-constant ERR-APPLICATION-NOT-FOUND (err u102))
+(define-constant ERR-ALREADY-VOTED (err u103))
+(define-constant ERR-NOT-ACTIVE (err u104))
+(define-constant ERR-DEADLINE-PASSED (err u105))
+(define-constant ERR-INVALID-DEADLINE (err u106))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u107))
+(define-constant ERR-MILESTONE-COMPLETED (err u108))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u109))
+(define-constant ERR-INVALID-REPUTATION-SCORE (err u110))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u111))
+(define-constant ERR-DELEGATE-NOT-MEMBER (err u112))
+(define-constant ERR-DELEGATION-LOOP (err u113))
+
+(define-data-var dao-owner principal tx-sender)
+(define-data-var min-votes uint u3)
+(define-data-var treasury-balance uint u0)
+(define-data-var milestone-counter uint u0)
+
+(define-map dao-members
+    principal
+    bool
+)
+(define-map scholarship-applications
+    uint
+    {
+        applicant: principal,
+        amount: uint,
+        status: (string-ascii 20),
+        votes: uint,
+        voters: (list 50 principal),
+        deadline: uint,
+        total-disbursed: uint,
+    }
+)
+
+(define-map scholarship-milestones
+    uint
+    {
+        application-id: uint,
+        description: (string-ascii 100),
+        amount: uint,
+        completed: bool,
+        completion-votes: uint,
+        completion-voters: (list 50 principal),
+    }
+)
+
+(define-map applicant-reputation
+    principal
+    {
+        score: uint,
+        completed-milestones: uint,
+        total-milestones: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map vote-delegations
+    principal
+    {
+        delegate: (optional principal),
+        delegated-at: uint,
+    }
+)
+
+(define-data-var application-counter uint u0)
+
+(define-public (initialize-dao (owner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set dao-owner owner)
+        (ok true)
+    )
+)
+
+(define-public (add-member (member principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-set dao-members member true)
+        (ok true)
+    )
+)
+
+(define-public (remove-member (member principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-delete dao-members member)
+        (ok true)
+    )
+)
+
+(define-public (submit-application
+        (amount uint)
+        (deadline uint)
+    )
+    (let ((application-id (+ (var-get application-counter) u1)))
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> deadline burn-block-height) ERR-INVALID-DEADLINE)
+        (map-set scholarship-applications application-id {
+            applicant: tx-sender,
+            amount: amount,
+            status: "pending",
+            votes: u0,
+            voters: (list),
+            deadline: deadline,
+            total-disbursed: u0,
+        })
+        (var-set application-counter application-id)
+        (ok application-id)
+    )
+)
+
+(define-public (vote-on-application (application-id uint))
+    (let (
+            (application (unwrap! (map-get? scholarship-applications application-id)
+                ERR-APPLICATION-NOT-FOUND
+            ))
+            (effective-voter (resolve-voter tx-sender))
+            (is-member (default-to false (map-get? dao-members effective-voter)))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status application) "pending") ERR-NOT-ACTIVE)
+        (asserts! (<= burn-block-height (get deadline application))
+            ERR-DEADLINE-PASSED
+        )
+        (asserts!
+            (not (is-some (index-of? (get voters application) effective-voter)))
+            ERR-ALREADY-VOTED
+        )
+        (map-set scholarship-applications application-id
+            (merge application {
+                votes: (+ (get votes application) u1),
+                voters: (unwrap-panic (as-max-len? (append (get voters application) effective-voter)
+                    u50
+                )),
+            })
+        )
+        (unwrap! (process-application application-id) (err u500))
+        (ok true)
+    )
+)
+
+(define-public (fund-treasury (amount uint))
+    (begin
+        (var-set treasury-balance (+ (var-get treasury-balance) amount))
+        (ok true)
+    )
+)
+
+(define-private (process-application (application-id uint))
+    (let ((application (unwrap-panic (map-get? scholarship-applications application-id))))
+        (if (>= (get votes application) (var-get min-votes))
+            (if (<= (get amount application) (var-get treasury-balance))
+                (begin
+                    (var-set treasury-balance
+                        (- (var-get treasury-balance) (get amount application))
+                    )
+                    (map-set scholarship-applications application-id
+                        (merge application { status: "approved" })
+                    )
+                    (ok true)
+                )
+                (begin
+                    (map-set scholarship-applications application-id
+                        (merge application { status: "rejected" })
+                    )
+                    (ok true)
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-application (application-id uint))
+    (map-get? scholarship-applications application-id)
+)
+
+(define-read-only (get-treasury-balance)
+    (ok (var-get treasury-balance))
+)
+
+(define-read-only (is-dao-member (member principal))
+    (default-to false (map-get? dao-members member))
+)
+
+(define-public (close-expired-application (application-id uint))
+    (let (
+            (application (unwrap! (map-get? scholarship-applications application-id)
+                ERR-APPLICATION-NOT-FOUND
+            ))
+            (is-member (default-to false (map-get? dao-members tx-sender)))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status application) "pending") ERR-NOT-ACTIVE)
+        (asserts! (> burn-block-height (get deadline application)) ERR-NOT-ACTIVE)
+        (map-set scholarship-applications application-id
+            (merge application { status: "expired" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (is-application-expired (application-id uint))
+    (let ((application (unwrap! (map-get? scholarship-applications application-id)
+            ERR-APPLICATION-NOT-FOUND
+        )))
+        (ok (> burn-block-height (get deadline application)))
+    )
+)
+
+(define-public (create-milestone
+        (application-id uint)
+        (description (string-ascii 100))
+        (amount uint)
+    )
+    (let (
+            (application (unwrap! (map-get? scholarship-applications application-id)
+                ERR-APPLICATION-NOT-FOUND
+            ))
+            (milestone-id (+ (var-get milestone-counter) u1))
+            (is-member (default-to false (map-get? dao-members tx-sender)))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status application) "approved") ERR-NOT-ACTIVE)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (map-set scholarship-milestones milestone-id {
+            application-id: application-id,
+            description: description,
+            amount: amount,
+            completed: false,
+            completion-votes: u0,
+            completion-voters: (list),
+        })
+        (var-set milestone-counter milestone-id)
+        (unwrap-panic (initialize-applicant-reputation (get applicant application)))
+        (unwrap-panic (update-milestone-count (get applicant application) u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (vote-milestone-completion (milestone-id uint))
+    (let (
+            (milestone (unwrap! (map-get? scholarship-milestones milestone-id)
+                ERR-MILESTONE-NOT-FOUND
+            ))
+            (effective-voter (resolve-voter tx-sender))
+            (is-member (default-to false (map-get? dao-members effective-voter)))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-COMPLETED)
+        (asserts!
+            (not (is-some (index-of? (get completion-voters milestone) effective-voter)))
+            ERR-ALREADY-VOTED
+        )
+        (map-set scholarship-milestones milestone-id
+            (merge milestone {
+                completion-votes: (+ (get completion-votes milestone) u1),
+                completion-voters: (unwrap-panic (as-max-len?
+                    (append (get completion-voters milestone) effective-voter)
+                    u50
+                )),
+            })
+        )
+        (unwrap! (process-milestone-completion milestone-id) (err u500))
+        (ok true)
+    )
+)
+
+(define-private (process-milestone-completion (milestone-id uint))
+    (let (
+            (milestone (unwrap-panic (map-get? scholarship-milestones milestone-id)))
+            (application-id (get application-id milestone))
+            (application (unwrap-panic (map-get? scholarship-applications application-id)))
+        )
+        (if (>= (get completion-votes milestone) (var-get min-votes))
+            (if (<= (get amount milestone) (var-get treasury-balance))
+                (begin
+                    (var-set treasury-balance
+                        (- (var-get treasury-balance) (get amount milestone))
+                    )
+                    (map-set scholarship-milestones milestone-id
+                        (merge milestone { completed: true })
+                    )
+                    (map-set scholarship-applications application-id
+                        (merge application { total-disbursed: (+ (get total-disbursed application)
+                            (get amount milestone)
+                        ) }
+                        ))
+                    (unwrap-panic (update-reputation-on-completion (get applicant application)))
+                    (ok true)
+                )
+                (err ERR-INSUFFICIENT-FUNDS)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? scholarship-milestones milestone-id)
+)
+
+(define-read-only (get-application-progress (application-id uint))
+    (let ((application (unwrap! (map-get? scholarship-applications application-id)
+            ERR-APPLICATION-NOT-FOUND
+        )))
+        (ok {
+            total-amount: (get amount application),
+            total-disbursed: (get total-disbursed application),
+            remaining: (- (get amount application) (get total-disbursed application)),
+        })
+    )
+)
+
+(define-private (initialize-applicant-reputation (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok true)
+        (begin
+            (map-set applicant-reputation applicant {
+                score: u100,
+                completed-milestones: u0,
+                total-milestones: u0,
+                last-updated: burn-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-milestone-count
+        (applicant principal)
+        (count uint)
+    )
+    (let ((reputation (unwrap-panic (map-get? applicant-reputation applicant))))
+        (map-set applicant-reputation applicant
+            (merge reputation {
+                total-milestones: (+ (get total-milestones reputation) count),
+                last-updated: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-reputation-on-completion (applicant principal))
+    (let ((reputation (unwrap-panic (map-get? applicant-reputation applicant))))
+        (let (
+                (completed-count (+ (get completed-milestones reputation) u1))
+                (total-count (get total-milestones reputation))
+                (completion-rate (if (> total-count u0)
+                    (/ (* completed-count u100) total-count)
+                    u100
+                ))
+            )
+            (map-set applicant-reputation applicant
+                (merge reputation {
+                    score: completion-rate,
+                    completed-milestones: completed-count,
+                    last-updated: burn-block-height,
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-applicant-reputation (applicant principal))
+    (map-get? applicant-reputation applicant)
+)
+
+(define-read-only (get-reputation-score (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok (get score reputation))
+        (ok u0)
+    )
+)
+
+(define-read-only (get-applicant-stats (applicant principal))
+    (match (map-get? applicant-reputation applicant)
+        reputation (ok {
+            completion-rate: (get score reputation),
+            completed-milestones: (get completed-milestones reputation),
+            total-milestones: (get total-milestones reputation),
+            last-activity: (get last-updated reputation),
+        })
+        (ok {
+            completion-rate: u0,
+            completed-milestones: u0,
+            total-milestones: u0,
+            last-activity: u0,
+        })
+    )
+)
+
+(define-public (delegate-vote (delegate principal))
+    (let (
+            (is-member (default-to false (map-get? dao-members tx-sender)))
+            (delegate-is-member (default-to false (map-get? dao-members delegate)))
+            (delegate-delegation (map-get? vote-delegations delegate))
+        )
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (asserts! delegate-is-member ERR-DELEGATE-NOT-MEMBER)
+        (match delegate-delegation
+            del-record (match (get delegate del-record)
+                next-delegate (asserts! (not (is-eq next-delegate tx-sender))
+                    ERR-DELEGATION-LOOP
+                )
+                true
+            )
+            true
+        )
+        (map-set vote-delegations tx-sender {
+            delegate: (some delegate),
+            delegated-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let ((is-member (default-to false (map-get? dao-members tx-sender))))
+        (asserts! is-member ERR-NOT-AUTHORIZED)
+        (map-set vote-delegations tx-sender {
+            delegate: none,
+            delegated-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-private (resolve-voter (voter principal))
+    (match (map-get? vote-delegations voter)
+        delegation-record (match (get delegate delegation-record)
+            delegate-principal
+            delegate-principal
+            voter
+        )
+        voter
+    )
+)
+
+(define-read-only (get-delegation (member principal))
+    (map-get? vote-delegations member)
+)
+
+(define-read-only (get-effective-voter (member principal))
+    (ok (resolve-voter member))
+)
